@@ -6,12 +6,9 @@ Licence: GNU GPLv3
 """
 
 import time
-import platform
 import warnings
 from math import floor
 from pathlib import Path
-
-import pyximport
 
 import numpy as np
 import pandas as pd
@@ -23,16 +20,13 @@ from scipy.spatial.distance import cdist
 
 from skimage.segmentation  import watershed
 from skimage.filters import threshold_otsu
-# from skimage.feature import peak_local_max
 
 from osgeo import gdal
 from osgeo import osr
 
-from shapely.geometry import mapping, Point, Polygon
+from shapely.geometry import Point, Polygon
 
 from rasterio.features import shapes as rioshapes
-
-import fiona
 
 import laspy
 
@@ -42,8 +36,8 @@ os.environ['GDAL_MEM_ENABLE_OPEN'] = 'YES'
 import arcpy
 arcpy.env.overwriteOutput = True
 
-from pycrown import _crown_dalponte_numba
-from pycrown import _crown_dalponteCIRC_numba
+from pycrown4arcgis import _crown_dalponte_numba
+from pycrown4arcgis import _crown_dalponteCIRC_numba
 
 gdal.UseExceptions()
 warnings.filterwarnings('ignore')
@@ -110,12 +104,17 @@ class PyCrown:
         PC.export_tree_crowns(crowntype='crown_poly_raster')
         PC.export_tree_crowns(crowntype='crown_poly_smooth')
         """
-
+        print("\nCREATING PYCROWN OBJECT:")
         suffix = f'_{suffix}' if suffix else ''
 
         self.outpath = Path(outpath) if outpath else Path('./')
+        self.chm = None
+        self.crowns = None
+        self.tree_markers = None
+        self.tt_corrected = None
 
         # Load the CHM
+        print("--> Loading input files...")
         self.chm_file = Path(chm_file)
         try:
             chm_gdal = gdal.Open(str(self.chm_file), gdal.GA_ReadOnly)
@@ -130,7 +129,6 @@ class PyCrown:
         self.ul_lat = chm_gdal.GetGeoTransform()[3]
         self.chm0 = chm_gdal.GetRasterBand(1).ReadAsArray()
         chm_gdal = None
-
 
         # Load the DTM
         try:
@@ -155,12 +153,9 @@ class PyCrown:
         self.las = None
         if las_file:
             self._load_lidar_points_cloud(las_file)
+        print("<-- Input Files Loaded.")
 
-        self.chm = None
-        self.crowns = None
-        self.tree_markers = None
-        self.tt_corrected = None
-
+        print("<-- Set up PyCrown trees object...")
         self.trees = pd.DataFrame(columns=[
             'top_height', 'top_elevation',
             'top_cor_height', 'top_cor_elevation',
@@ -179,6 +174,7 @@ class PyCrown:
             'top': 'object',
             'tt_corrected': 'int'
         })
+        print("<-- Created.")
 
     def _load_lidar_points_cloud(self, fname):
         """ Loads LiDAR dataset
@@ -188,23 +184,31 @@ class PyCrown:
         fname :   str
                   Path to LiDAR dataset (.las or .laz-file)
         """
+        print("    - Reading .las file:")
         las = laspy.read(str(fname))
 
+        print("        - Filtering las classification 2 (ground) and 6 (building):")
+        ## Builds a list from 0 - 18
         classification_list = list(range(19))
         ## class 2 = ground, class 6 = Building
         values_to_remove = [2, 6]
-        desired_classifications = [item for item in classification_list if item not in values_to_remove] 
+        ## list comprehension to get rid of the values_to_remove
+        desired_classifications = [item for item in classification_list if item not in values_to_remove]
+        ## only include the desired_classifications
         mask = (las.classification == desired_classifications[0])
         for classification_value in desired_classifications[1:]:
             mask = mask | (las.classification == classification_value)
         las = las.points[mask]
+        print("        - Filtered.")
 
+        print("        - Loading las into DataFrame:")
         lidar_points = np.array((
             las.x, las.y, las.z, las.intensity, las.return_num,
             las.classification
         )).transpose()
         colnames = ['x', 'y', 'z', 'intensity', 'return_num', 'classification']
         self.las = pd.DataFrame(lidar_points, columns=colnames)
+        print("        - las points loaded.")
 
     def _check_empty(self):
         """ Helper function raising an Exception if no trees present
@@ -389,7 +393,7 @@ class PyCrown:
         else:
             return np.ones((int(radius), int(radius)))
 
-    def _smooth_raster(self, raster, ws, resolution, circular=False):
+    def _smooth_raster(self, raster, ws, circular=False):
         """ Smooth a raster with a median filter
 
         Parameters
@@ -398,8 +402,6 @@ class PyCrown:
                       raster to be smoothed
         ws :          int
                       window size of smoothing filter
-        resolution :  int
-                      resolution of raster in m
         circular :    bool, optional
                       set to True for disc-shaped filter kernel, block otherwise
 
@@ -411,37 +413,6 @@ class PyCrown:
         return filters.median_filter(
             raster, footprint=self._get_kernel(ws, circular=circular))
 
-    def clip_data_to_bbox(self, bbox, las_offset=10):
-        """ Clip input data to subset region based on bounding box
-
-        Parameters
-        ----------
-        bbox :    tuple
-                  lon_min, lon_max, lat_min, lat_max
-        las_offset :  int, optional
-                      buffer around bounding for LiDAR data (in m)
-        """
-
-        lon_min, lon_max, lat_min, lat_max = bbox
-        col_min, row_max = self._to_colrow(lon_min, lat_min, self.resolution)
-        col_max, row_min = self._to_colrow(lon_max, lat_max, self.resolution)
-
-        self.chm0 = self.chm0[row_min:row_max, col_min:col_max]
-        if isinstance(self.chm, np.ndarray):
-            self.chm = self.chm[row_min:row_max, col_min:col_max]
-        self.dtm = self.dtm[row_min:row_max, col_min:col_max]
-        self.dsm = self.dsm[row_min:row_max, col_min:col_max]
-        lasmask = (
-            (self.las.x >= lon_min - las_offset) &
-            (self.las.x <= lon_max + las_offset) &
-            (self.las.y >= lat_min - las_offset) &
-            (self.las.y <= lat_max + las_offset)
-        )
-        self.las = self.las[lasmask]
-
-        self.ul_lon = lon_min
-        self.ul_lat = lat_max
-
     def get_tree_height_elevation(self, loc='top'):
         ''' Sets tree height and elevation in tree dataframe
 
@@ -450,11 +421,15 @@ class PyCrown:
         loc :    str, optional
                  initial or corrected tree top location: `top` or `top_cor`
         '''
+        location = "TREE TOPS" if loc == "top" else "CORRECTED TREE TOPS" 
+        print(f"\nGET TREE HEIGHT AND ELEVATION FOR {location}:")
         lons, lats = self._tree_lonlat(loc)
+        print("--> Set height to CHM value, set elevation to DTM value...")
         self.trees[f'{loc}_height'] = self._get_z(
             lons, lats, self.chm, self.resolution)
         self.trees[f'{loc}_elevation'] = self._get_z(
             lons, lats, self.dtm, self.resolution)
+        print(f"<-- Height and elevation set for {location.lower()}.")
 
     def filter_chm(self, ws, ws_in_pixels=False, circular=False):
         ''' Pre-process the canopy height model (smoothing and outlier removal).
@@ -470,17 +445,19 @@ class PyCrown:
         circular :      bool, optional
                         set to True for disc-shaped filter kernel, block otherwise
         '''
+        print("\nFILTER CHM TO SMOOTH AND REMOVE OUTLIERS:")
         if not ws_in_pixels:
             if ws % self.resolution:
                 raise Exception("Image filter size not an integer number. Please check if image resolution matches filter size (in metre or pixel).")
             else:
                 ws = int(ws / self.resolution)
 
-        self.chm = self._smooth_raster(self.chm0, ws, self.resolution,
-                                       circular=circular)
-        self.chm0[np.isnan(self.chm0)] = 0.
+        print("--> Applying a median filter (scipy.ndimage.filters.median_filter)...")
+        self.chm = self._smooth_raster(self.chm0, ws, circular=circular)
+        self.chm0[np.isnan(self.chm0)] = 0
         zmask = (self.chm < 0.5) | np.isnan(self.chm) | (self.chm > 60.)
         self.chm[zmask] = 0
+        print("<-- CHM Filtered.")
 
     def tree_detection(self, raster, resolution=None, ws=5, hmin=20,
                        return_trees=False, ws_in_pixels=False):
@@ -510,7 +487,7 @@ class PyCrown:
         ndarray (optional)
             nx2 array of tree top pixel coordinates
         '''
-
+        print("\nDETECTING INDIVIDUAL TREES.")
         if not isinstance(raster, np.ndarray):
             raise Exception("Please provide an input raster as numpy ndarray.")
 
@@ -522,15 +499,12 @@ class PyCrown:
             else:
                 ws = int(ws / resolution)
 
-        # Maximum filter to find local peaks
+        print("--> Apply scipy.ndimage.filters.maximum_filter to find maximum value within window size...")
         raster_maximum = filters.maximum_filter(
-            raster, footprint=self._get_kernel(ws, circular=True))
+            raster,
+            footprint = self._get_kernel(ws, circular=True)
+        )
         tree_maxima = raster == raster_maximum
-
-        # alternative using skimage peak_local_max
-        # chm = inraster.copy()
-        # chm[np.isnan(chm)] = 0.
-        # tree_maxima = peak_local_max(chm, indices=False, footprint=kernel)
 
         # remove tree tops lower than minimum height
         tree_maxima[raster <= hmin] = 0
@@ -538,9 +512,12 @@ class PyCrown:
         # label each tree
         self.tree_markers, num_objects = ndimage.label(tree_maxima)
 
+        print("<-- Filter applied.")
+
         if num_objects == 0:
             raise NoTreesException
 
+        print("--> When multiple pixels in the window have the same maxima,\n    apply scipy.ndimage.center_of_mass to find the weighted average...")
         # if canopy height is the same for multiple pixels,
         # place the tree top in the center of mass of the pixel bounds
         yx = np.array(
@@ -559,6 +536,7 @@ class PyCrown:
             df = pd.DataFrame(np.array([trees, trees], dtype='object').T,
                               dtype='object', columns=['top_cor', 'top'])
             self.trees = pd.concat([self.trees, df])
+        print("<-- Applied; Tree Detection Complete:\n    - Number of trees detected: {len(self.trees)}")
 
         self._check_empty()
 
@@ -569,8 +547,9 @@ class PyCrown:
         ----------
         algorithm :  str
                      crown delineation algorithm to be used, choose from:
-                     ['dalponte_numba',
-                      'dalponteCIRC_numba', 'watershed_skimage']
+                      'dalponte_numba',
+                      'dalponteCIRC_numba',
+                      'watershed_skimage'
         loc :        str, optional
                      tree seed position: `top` or `top_cor`
         th_seed :    float
@@ -587,7 +566,7 @@ class PyCrown:
         ndarray
             raster of individual tree crowns
         """
-        timeit = 'Tree crowns delineation: {:.3f}s'
+        print("\nDELINEATE CROWNS:")
 
         # get the tree seeds (starting points for crown delineation)
         seeds = self._tree_colrow(loc, self.resolution)
@@ -601,13 +580,15 @@ class PyCrown:
         if kwargs.get('max_crown'):
             max_crown = kwargs['max_crown'] / self.resolution
 
+        print(f"--> Delineating crowns using the {algorithm} algorithm...")
+        timeit = "<-- Delineation took {:.3f}s:"
         if algorithm == 'dalponte_cython':
             print("dalponte_cython algorithm not available. using dalponteCIRC_numba instead.")
             algorithm = 'dalponteCIRC_numba'
 
         elif algorithm == 'dalponte_numba':
             tt = time.time()
-            crowns = _crown_dalponte_numba._crown_dalponte(
+            crowns = _crown_dalponte_numba.crown_dalponte(
                 inraster, seeds,
                 th_seed=float(kwargs['th_seed']),
                 th_crown=float(kwargs['th_crown']),
@@ -618,7 +599,7 @@ class PyCrown:
 
         elif algorithm == 'dalponteCIRC_numba':
             tt = time.time()
-            crowns = _crown_dalponteCIRC_numba._crown_dalponteCIRC(
+            crowns = _crown_dalponteCIRC_numba.crown_dalponteCIRC(
                 inraster, seeds,
                 th_seed=float(kwargs['th_seed']),
                 th_crown=float(kwargs['th_crown']),
@@ -635,62 +616,7 @@ class PyCrown:
             print(timeit.format(time.time() - tt))
 
         self.crowns = np.array(crowns, dtype=np.int32)
-
-    def clip_trees_to_bbox(self, bbox=None, inbuf=None, f_tiles=None, row=None,
-                           col=None, loc='top'):
-        """ Clip tree tops and crowns to bounding box or tile extent.
-        Tree dataframe is updated with subset of trees.
-
-        Parameters
-        ----------
-        bbox :     tuple, optional
-                   floats for (lon_min, lon_max, lat_min, lat_max)
-        inbuf :    integer or float, optional
-                   distance of inward buffer in metres
-        f_tiles :  str, optional
-                   Path to LiDAR tiles polygon with coordinates for all
-                   bounding boxes for each tile
-        row :      int, optional
-                   row number of tile
-        col :      int, optional
-                   column number of tile
-        loc :      str, optional
-                   tree seed position: `top` or `top_cor`
-        """
-        if bbox:
-            lon_min, lon_max, lat_min, lat_max = bbox
-        elif inbuf:
-            lat_max = self.ul_lat - inbuf
-            lat_min = self.ul_lat - (self.chm.shape[0] * self.resolution) - inbuf
-            lon_min = self.ul_lon + inbuf
-            lon_max = self.ul_lon + (self.chm.shape[1] * self.resolution) - inbuf
-        elif f_tiles:
-            # get the bounding box of each tile
-            with fiona.open(f_tiles, 'r') as tilepolys_layer:
-                tiles = {}
-                for tile in tilepolys_layer:
-                    r = tile['properties']['Row']
-                    c = tile['properties']['Col']
-                    lon_min = tile['geometry']['coordinates'][0][0][0]
-                    lat_min = tile['geometry']['coordinates'][0][0][1]
-                    lon_max = tile['geometry']['coordinates'][0][2][0]
-                    lat_max = tile['geometry']['coordinates'][0][1][1]
-                    tiles[r, c] = lon_min, lat_min, lon_max, lat_max
-
-            # identify and clip tree tops inside tile
-            lon_min, lat_min, lon_max, lat_max = tiles[row, col]
-        else:
-            raise Exception("No clipping method specified.")
-
-        tree_lons, tree_lats = self._tree_lonlat(loc)
-        cond = (
-            (tree_lons >= lon_min) & (tree_lons < lon_max) &
-            (tree_lats >= lat_min) & (tree_lats < lat_max)
-        )
-        self.trees = self.trees[cond]
-
-        if isinstance(self.crowns, np.ndarray):
-            self._screen_crowns(cond)
+        print(f"    - Number of crowns delineated: {len(self.crowns)}")
 
     def correct_tree_tops(self, check_all=False):
         """ Correct the location of tree tops in steep terrain.
@@ -703,7 +629,7 @@ class PyCrown:
                        whether they are located on steep terrain
         """
 
-        print(f'Number of trees: {len(self.trees)}')
+        print(f"\nCORRECT TREE TOPS FOR STEEP TERRAIN:")
 
         # calculate center of mass of crowns
         comass = np.array(
@@ -715,6 +641,7 @@ class PyCrown:
         corr_dsm = 0
         corr_com = 0
 
+        print("--> Check if tree top is too far down-slope compared to crown_mean...")
         for tidx in range(len(self.trees)):
             tree = self.trees.iloc[tidx]
             col, row = self._to_colrow(tree['top'].x, tree['top'].y,
@@ -728,7 +655,6 @@ class PyCrown:
                 self.trees.tt_corrected.iloc[tidx] = -1
                 continue
 
-            # check if tree top too far down-slope compared to crown_mean
             if self.dtm[row, col] <= (dtm_mean - dtm_std) or check_all:
 
                 # find highest DSM location in crown
@@ -743,8 +669,8 @@ class PyCrown:
                                     comass[tidx][np.newaxis])
 
                 # assign high point position from DSM if new location is not
-                # too far from centre of mass of the crown, in the latter case
-                # place the tree top at the centre of mass
+                # too far from centre of mass of the crown (1), in the latter case
+                # place the tree top at the centre of mass (2)
                 corr_n += 1
 
                 if dist_dh_com <= (1. * np.nanmean(distances)):
@@ -762,12 +688,12 @@ class PyCrown:
 
             else:
                 self.trees.tt_corrected.iloc[tidx] = 0
+        print("<-- Checked:")
 
-        print(f'Tree tops corrected: {corr_n}')
         if len(self.trees) > 0:
-            print(f'Tree tops corrected: {100 * corr_n / len(self.trees)}%')
-            print(f'DSM correction: {corr_dsm}')
-            print(f'COM correction: {corr_com}')
+            print(f'    - Tree tops corrected: {100 * corr_n / len(self.trees)}%')
+            print(f'    - Corrected tree top by moving to DSM high point: {corr_dsm}')
+            print(f'    - Corrected tree top by moving Center of Mass: {corr_com}')
         return corr_dsm, corr_com
 
     def screen_small_trees(self, hmin=20., loc='top'):
@@ -793,19 +719,23 @@ class PyCrown:
         ''' Converts tree crown raster to individual polygons and stores them
         in the tree dataframe
         '''
+        print("\nCONVERTING TREE CROWN RASTERS TO POLYGONS:")
         polys = []
+        print("--> Convert pixel coordinates to lat/long,\n    create a path from points for the polygon edges,\n    and create a shapely.geometry.Polygon from the edges...")
         for feature in rioshapes(self.crowns, mask=self.crowns.astype(bool)):
-
             # Convert pixel coordinates to lon/lat
             edges = feature[0]['coordinates'][0].copy()
             for i in range(len(edges)):
                 edges[i] = self._to_lonlat(*edges[i], self.resolution)
 
-            # poly_smooth = self.smooth_poly(Polygon(edges), s=None, k=9)
             polys.append(Polygon(edges))
         self.trees.crown_poly_raster = polys
+        print("<-- Tree crowns converted from raster to polys.")
 
-    def crowns_to_polys_smooth(self, store_las=True, thin_perc=None,
+    def crowns_to_polys_smooth(self,
+                               store_las=True,
+                               output_las_name="trees.las",
+                               thin_perc=None,
                                first_return=True):
         """ Smooth crown polygons using Dalponte & Coomes (2016) approach:
         Builds a convex hull around first return points (which lie within the
@@ -815,29 +745,33 @@ class PyCrown:
 
         Parameters
         ----------
-        store_las :    bool
-                       set to True if LiDAR point clouds shopuld be classified
-                       and stored externally
-        thin_perc :    None or int
-                       percentage amount by how much the point cloud should be
-                       thinned out randomly
-        first_return : bool
-                       use first return points to create convex hull (all
-                       points otherwise)
+        store_las :         bool
+                            set to True if LiDAR point clouds should be classified
+                            and stored externally
+        output_las_name:    str
+                            name of las to be saved
+        thin_perc :         None or int
+                            percentage amount by how much the point cloud should be
+                            thinned out randomly
+        first_return :      bool
+                            use first return points to create convex hull (all
+                            points otherwise)
         """
-
+        print("\nSMOOTHING RASTER POLYGONS USING A CONVEX HULL:")
         if thin_perc:
             thin_size = floor(len(self.las) * (1 - thin_perc))
             lidar_geodf = self.las.sample(n=thin_size)
         else:
             lidar_geodf = self.las
 
-        print('Converting LAS point cloud to shapely points')
+        print("--> Converting LAS point cloud to shapely points...")
         geometry = [Point(xy) for xy in zip(lidar_geodf.x, lidar_geodf.y)]
         lidar_geodf = gpd.GeoDataFrame(lidar_geodf, crs=f'epsg:{self.epsg}',
                                        geometry=geometry)
+        print("<-- Converted.")
 
-        print('Converting raster crowns to shapely polygons')
+
+        print("--> Converting raster crowns to shapely polygons...")
         polys = []
         for feature in rioshapes(self.crowns, mask=self.crowns.astype(bool)):
             edges = np.array(list(zip(*feature[0]['coordinates'][0])))
@@ -848,16 +782,18 @@ class PyCrown:
             pd.DataFrame(np.arange(len(self.trees))),
             crs=f'epsg:{self.epsg}', geometry=polys
         )
+        print("<-- Converted.")
 
-        print('Attach LiDAR points to corresponding crowns')
+        print("--> Attaching LiDAR points to corresponding crowns...")
         lidar_in_crowns = gpd.sjoin(lidar_geodf, crown_geodf,
                                     predicate='within', how="inner")
 
         lidar_tree_class = np.zeros(lidar_in_crowns['index_right'].size)
         lidar_tree_mask = np.zeros(lidar_in_crowns['index_right'].size,
                                    dtype=bool)
+        print("<-- Attached.")
 
-        print('Create convex hull around first return points')
+        print("--> Creating convex hull around first return points...")
         polys = []
         for tidx in range(len(self.trees)):
             bool_indices = lidar_in_crowns['index_right'] == tidx
@@ -875,9 +811,25 @@ class PyCrown:
             lidar_tree_mask[bool_indices] = \
                 lidar_in_crowns[bool_indices].within(hull)
         self.trees.crown_poly_smooth = polys
+        print("<-- Created.")
 
         if store_las:
-            print('Classifying point cloud')
+            print("\nEXPORTING LAS BASED ON GENERATED CONVEX HULL:")
+
+            os.makedirs(self.outpath, exist_ok=True)
+
+            ## delete all files with the basename output_raster_name if it exists. if it doesn't, fail silently.
+            try:
+                file_basename = output_las_name.split(".", 1)[0]
+                os.remove(os.path.join(str(self.outpath), file_basename))
+            except OSError:
+                pass
+
+            if ".shp" not in output_las_name:
+                output_las_name = output_las_name + ".las"
+            path_to_output_las = os.path.join(str(self.outpath), output_las_name)
+
+            print("--> Classifying las...")
             lidar_in_crowns = lidar_in_crowns[lidar_tree_mask]
             lidar_tree_class = lidar_tree_class[lidar_tree_mask]
             header = laspy.LasHeader()
@@ -893,11 +845,18 @@ class PyCrown:
             outfile.z = lidar_in_crowns.z
             outfile.user_data = lidar_tree_class
             outfile.intensity = lidar_tree_class
-            outfile.write(os.path.join(self.outpath, "trees.las"))
+            print("<-- Classified.")
+
+            print("--> Saving .las file to disk...")
+            outfile.write(path_to_output_las)
+            print("<-- Saved.")
+
+            print("--> Projecting .las file...")
             arcpy.management.DefineProjection(
-                in_dataset = os.path.join(self.outpath, "trees.las"),
+                in_dataset = path_to_output_las,
                 coor_system = self.srs
             )
+            print("<-- Projected.")
 
         self.lidar_in_crowns = lidar_in_crowns
 
@@ -910,6 +869,7 @@ class PyCrown:
         all_good :    bool
                       set to True if all trees should pass the quality check
         """
+        print("\nCONDUCTING QUALITY CONTROL:")
         if all_good:
             self.trees.tt_corrected = np.zeros(len(self.trees), dtype=int)
         else:
@@ -921,36 +881,58 @@ class PyCrown:
             self.trees = self.trees[cond]
 
         self._check_empty()
+        print("<-- PyCrown.trees is not empty; good to continue.")
 
-    def export_tree_locations(self, loc='top'):
+    def export_tree_locations(self, loc='top', output_shape_name="top"):
         """ Convert tree top raster indices to georeferenced 3D point shapefile
 
         Parameters
         ----------
-        loc :     str, optional
-                  tree seed position: `top` or `top_cor`
+        loc :               str, optional
+                            tree seed position: `top` or `top_cor`
+        output_shape_name : str
+                            name of shapefile to be saved
         """
+        print(f"\nEXPORTING SHAPEFILE {output_shape_name}:")
         os.makedirs(self.outpath, exist_ok=True)
+        arcpy.env.workspace = str(self.outpath)
+        arcpy.env.scratchWorkspace = str(self.outpath)
 
+        ## delete all files with the basename output_raster_name if it exists. if it doesn't, fail silently.
+        try:
+            file_basename = output_shape_name.split(".", 1)[0]
+            os.remove(os.path.join(str(self.outpath), file_basename))
+        except OSError:
+            pass
+
+        if ".shp" not in output_shape_name:
+            output_shape_name = output_shape_name + ".shp"
+        path_to_output_shape = os.path.join(str(self.outpath), output_shape_name)
+
+        print("--> Create shapefile...")
         output_feature_class = arcpy.management.CreateFeatureclass(
             out_path = str(self.outpath),
-            out_name = f"tree_location_{loc}.shp",
+            out_name = output_shape_name,
             geometry_type = "POINT",
             has_z = "ENABLED",
             spatial_reference = self.srs
         )
+        print("<-- Created.")
 
+        print("--> Add fields...")
         arcpy.management.AddFields(
             in_table = output_feature_class,
             field_description =
                 [
                     ["TreeID", "TEXT"],
-                    ["TreeHeight", "FLOAT"],
-                    ["Corrected", "SHORT"]
+                    ["TreeHtMtr", "FLOAT"],
+                    ["Corrected", "TEXT"]
                 ]
         )
+        print("<-- Added.")
 
-        fields = ["SHAPE@XYZ", "TreeID", "TreeHeight", "Corrected"]
+        print(f"--> Inserting rows into {output_shape_name} at {path_to_output_shape}...")
+        fields = ["SHAPE@XYZ", "TreeID", "TreeHtMtr", "Corrected"]
         with arcpy.da.InsertCursor(output_feature_class, fields) as cursor:
             for tree_index in range(len(self.trees)):
                 tree = self.trees.iloc[tree_index]
@@ -958,47 +940,104 @@ class PyCrown:
                 y_coord = tree[loc].y
                 z_coord = tree[f'{loc}_elevation']
                 TreeID = tree_index
-                TreeHeight = float(tree[f'{loc}_height'])
-                TreeTopCorrected = int(tree.tt_corrected)
-
-                # Create Point and PointGeometry objects
+                TreeHeightMeters = round(float(tree[f'{loc}_height']), 3)
+                TreeTopCorrected = "DSM Height" if tree.tt_corrected == 1 else "Corrected to Center of Mass"
                 point = arcpy.Point(float(x_coord), float(y_coord), float(z_coord))
                 point_geometry = arcpy.PointGeometry(point, self.srs)
 
                 # Insert the row
-                cursor.insertRow((point_geometry, TreeID, TreeHeight, TreeTopCorrected))
+                cursor.insertRow((point_geometry, TreeID, TreeHeightMeters, TreeTopCorrected))
+        print(f"<-- Saved {path_to_output_shape}.")
 
-    def export_tree_crowns(self, crowntype='crown_poly_smooth'):
+        if loc == "top_cor":
+            print(f"--> On corrected tree tops, estimate DBH using power function derived from field data for Flagstaff Ponderosa Pine")
+            print(f"    See: https://www.sciencedirect.com/science/article/pii/S037811272031464X")
+            print(f"    See: https://www.sciencedirect.com/science/article/pii/S0378112724000185")
+            print("     - Add fields...")
+            arcpy.management.AddFields(
+                in_table = output_feature_class,
+                field_description =
+                [
+                    ["TreeDbhCm", "FLOAT"],
+                    ["TreeHtFt", "FLOAT"],
+                    ["TreeDbhIn", "FLOAT"],
+                ]
+            )
+            print("     - Added.")
+            print("     - Calculate fields...")
+            arcpy.management.CalculateField(
+                in_table=path_to_output_shape,
+                field="TreeDbhCm",
+                expression="calcDbh(!TreeHtMtr!)",
+                expression_type="PYTHON3",
+                code_block=
+                    ("def calcDbh(TreeHtMtr):\n"
+                     "    import math\n"
+                     "    return round(float(0.87*(math.pow(TreeHtMtr,1.23))), 2)")
+            )
+            arcpy.management.CalculateField(
+                in_table=path_to_output_shape,
+                field="TreeHtFt",
+                expression="round((!TreeHtMtr! * 3.28084), 2)"
+            )
+            arcpy.management.CalculateField(
+                in_table=path_to_output_shape,
+                field="TreeDbhIn",
+                expression="round((!TreeDbhCm! / 2.54), 2)"
+            )
+            print("     - Calculated.")
+
+    def export_tree_crowns(self, crowntype="crown_poly_smooth", output_shape_name="crown_poly_smooth"):
         """ Convert tree crown raster to georeferenced polygon shapefile
 
         Parameters
         ----------
-        crowntype :   str, optional
-                      choose whether the raster of smoothed version should be
-                      exported: `crown_poly_smooth` or `crown_poly_raster`
+        crowntype :         str, optional
+                            choose whether the raster of smoothed version should be
+                            exported: `crown_poly_smooth` or `crown_poly_raster`
+        output_shape_name : str
+                            name of shapefile to be saved
         """
-
+        print(f"\nEXPORTING SHAPEFILE {output_shape_name}:")
         os.makedirs(self.outpath, exist_ok=True)
+        arcpy.env.workspace = str(self.outpath)
+        arcpy.env.scratchWorkspace = str(self.outpath)
 
+        ## delete all files with the basename output_raster_name if it exists. if it doesn't, fail silently.
+        try:
+            file_basename = output_shape_name.split(".", 1)[0]
+            os.remove(os.path.join(str(self.outpath), file_basename))
+        except OSError:
+            pass
+
+        if ".shp" not in output_shape_name:
+            output_shape_name = output_shape_name + ".shp"
+        path_to_output_shape = os.path.join(str(self.outpath), output_shape_name)
+
+        print("--> Create shapefile...")
         output_feature_class = arcpy.management.CreateFeatureclass(
             out_path = str(self.outpath),
-            out_name = f"tree_{crowntype}.shp",
+            out_name = output_shape_name,
             geometry_type = "POLYGON",
             has_z = "ENABLED",
             spatial_reference = self.srs
         )
+        print("<-- Created.")
 
+        print("--> Add fields...")
         arcpy.management.AddFields(
             in_table = output_feature_class,
             field_description =
                 [
                     ["TreeID", "TEXT"],
-                    ["TopHeight", "FLOAT"],
-                    ["CorrHeight", "FLOAT"]
+                    ["TopHtMtr", "FLOAT"],
+                    ["CorrHtMtr", "FLOAT"]
                 ]
         )
+        print("<-- Added.")
 
-        fields = ["SHAPE@", "TreeID", "TopHeight", "CorrHeight"]
+        print(f"--> Inserting rows into {output_shape_name} at {path_to_output_shape}...")
+        fields = ["SHAPE@", "TreeID", "TopHtMtr", "CorrHtMtr"]
         with arcpy.da.InsertCursor(output_feature_class, fields) as cursor:
             for tree_index in range(len(self.trees)):
                 tree = self.trees.iloc[tree_index]
@@ -1011,49 +1050,102 @@ class PyCrown:
                     polygon = arcpy.Polygon(array, self._screen_crowns)
 
                     TreeID = tree_index
-                    TreeHeight = float(tree.top_height)
-                    CorrHeight = float(tree.top_cor_height)
+                    TreeHeight = round(float(tree.top_height), 2)
+                    CorrHeight = round(float(tree.top_cor_height), 2)
 
                     # Insert the row
                     cursor.insertRow((polygon, TreeID, TreeHeight, CorrHeight))
+        print(f"<-- Saved {path_to_output_shape}.")
 
-    def export_raster(self, raster, fname, title, res=None):
+        if crowntype == "crown_poly_smooth":
+            print("--> Join TreeDbhCm, TreeHtFt, and TreeDbhIn to crowns...")
+            corrected_tops_shape_name = f"{output_shape_name.split('_', 1)[0]}_PyCrownTreesCorrected.shp"
+            arcpy.management.JoinField(
+                in_data=path_to_output_shape,
+                in_field="TreeID",
+                join_table=os.path.join(str(self.outpath), corrected_tops_shape_name),
+                join_field="TreeID",
+                fields="TreeDbhCm;TreeHtFt;TreeDbhIn"
+            )
+            print("<-- Joined.")
+
+    def export_raster(self, raster, output_raster_name, input_mask_file, res=None):
         """ Write array to raster file with gdal
 
         Parameters
         ----------
-        raster :    ndarray
-                    raster to be exported
-        fname :     str
-                    file name
-        title :     str
-                    gdal title of the file
-        res :       int/float, optional
-                    resolution of the raster in m, if not provided the same as
-                    the input CHM
+        raster :                ndarray
+                                raster to be exported
+        output_raster_name :    str
+                                file name
+        input_mask_file :       str, path
+                                file path to a polygon feature class that will be used as the boundary mask for the analysis
+        res :                   int/float, optional
+                                resolution of the raster in m, if not provided the same as
+                                the input CHM
         """
-        res = res if res else self.resolution
+        print(f"\nEXPORTING RASTER {output_raster_name}:")
 
         os.makedirs(self.outpath, exist_ok=True)
+        arcpy.env.workspace = str(self.outpath)
+        arcpy.env.scratchWorkspace = str(self.outpath)
 
-        ## delete file if it exists. if it doesn't, fail silently.
+        res = res if res else self.resolution
+
+        ## delete all files with the basename output_raster_name if it exists. if it doesn't, fail silently.
         try:
-            os.remove(fname)
+            file_basename = output_raster_name.split(".", 1)[0]
+            os.remove(os.path.join(str(self.outpath), file_basename))
         except OSError:
             pass
 
+        if ".tif" not in output_raster_name:
+            output_raster_name = output_raster_name + ".tif"
+        path_to_output_raster = os.path.join(str(self.outpath), output_raster_name)
+
+        print("--> Convert NumPyArrayToRaster...")
         input_chm = arcpy.Raster(str(self.chm_file))
         raster_extent = input_chm.extent
+
         output_chm = arcpy.NumPyArrayToRaster(
             in_array = raster,
             lower_left_corner = arcpy.Point(raster_extent.XMin, raster_extent.YMin),
             x_cell_size = res,
             y_cell_size = res
         )
-        arcpy.management.DefineProjection(
-            in_dataset = output_chm,
-            coor_system = self.srs
+        print("<-- Converted.")
+
+        path_to_temp_tif = os.path.join(str(self.outpath), "temp.tif")
+        print(f"--> Saving temporary tif for further processing...")
+        output_chm.save(path_to_temp_tif)
+        print(f"<-- Saved temp.tif.")
+
+        arcpy.management.BuildPyramidsandStatistics(
+            in_workspace = path_to_temp_tif
         )
 
-        null_raster = arcpy.sa.SetNull(output_chm, output_chm, "VALUE = 0")
-        null_raster.save(fname)
+        print("--> Define Raster Projection...")
+        arcpy.management.DefineProjection(
+            in_dataset = path_to_temp_tif,
+            coor_system = self.srs
+        )
+        print("<-- Defined.")
+
+        try:
+            print("--> Calculate Null raster values to 0...")
+            arcpy.sa.SetNull(path_to_temp_tif, path_to_temp_tif, "VALUE = 0")
+            print("<-- Calculated.")
+        except:
+            print("<-- arcpy.sa.SetNull failed.")
+
+        print(f"--> Extracting {output_raster_name} to inside mask...")
+        final_chm_out_raster = arcpy.sa.ExtractByMask(
+            in_raster = path_to_temp_tif,
+            in_mask_data = input_mask_file,
+            extraction_area = "INSIDE"
+        )
+        final_chm_out_raster.save(path_to_output_raster)
+        print(f"<-- Saved {path_to_output_raster}.")
+
+        if arcpy.Exists(path_to_temp_tif):
+            arcpy.management.Delete(path_to_temp_tif)
