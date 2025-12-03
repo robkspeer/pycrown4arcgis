@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+import random
 
 import scipy.ndimage as ndimage
 import scipy.ndimage.filters as filters
@@ -82,27 +83,6 @@ class PyCrown:
                     Output directory
         suffix   :  str, optional
                     text appended to output file names
-
-        Example
-        -------
-
-        PC = PyCrown(F_CHM, F_DTM, F_DSM, F_LAS, outpath=sys.argv[1])
-        PC.filter_chm(5)
-        PC.tree_detection(PC.chm, ws=5, hmin=16.)
-        PC.crown_delineation(algorithm='dalponteCIRC_numba', th_tree=15.,
-                             th_seed=0.7, th_crown=0.55, max_crown=10.)
-        PC.correct_tree_tops()
-        PC.get_tree_height_elevation(loc='top')
-        PC.get_tree_height_elevation(loc='top_cor')
-        PC.screen_small_trees(hmin=20., loc='top')
-        PC.crowns_to_polys_raster()
-        PC.crowns_to_polys_smooth(store_las=True)
-        PC.quality_control()
-        PC.export_raster(PC.chm, PC.outpath / 'chm.tif', 'CHM')
-        PC.export_tree_locations(loc='top')
-        PC.export_tree_locations(loc='top_cor')
-        PC.export_tree_crowns(crowntype='crown_poly_raster')
-        PC.export_tree_crowns(crowntype='crown_poly_smooth')
         """
         print("\nCREATING PYCROWN OBJECT:")
         suffix = f'_{suffix}' if suffix else ''
@@ -157,10 +137,16 @@ class PyCrown:
 
         print("<-- Set up PyCrown trees object...")
         self.trees = pd.DataFrame(columns=[
-            'top_height', 'top_elevation',
-            'top_cor_height', 'top_cor_elevation',
-            'crown_poly_raster', 'crown_poly_smooth',
-            'top_cor', 'top', 'tt_corrected'
+            'top_height',
+            'top_elevation',
+            'top_cor_height',
+            'top_cor_elevation',
+            'crown_poly_raster',
+            'crown_poly_smooth',
+            'top_cor',
+            'top',
+            'tt_corrected',
+            'tree_id'
         ])
 
         self.trees = self.trees.astype(dtype={
@@ -172,8 +158,10 @@ class PyCrown:
             'crown_poly_smooth': 'object',
             'top_cor': 'object',
             'top': 'object',
-            'tt_corrected': 'int'
+            'tt_corrected': 'int',
+            'tree_id': 'int'
         })
+
         print("<-- Created.")
 
     def _load_lidar_points_cloud(self, fname):
@@ -332,7 +320,7 @@ class PyCrown:
                                np.array([tree.y for tree in self.trees[loc]]),
                                resolution).astype(np.int32)
 
-    def _watershed(self, inraster, th_tree=15.):
+    def _watershed(self, inraster, th_tree=1.4):
         """ Simple implementation of a watershed tree crown delineation
 
         Parameters
@@ -431,7 +419,7 @@ class PyCrown:
             lons, lats, self.dtm, self.resolution)
         print(f"<-- Height and elevation set for {location.lower()}.")
 
-    def filter_chm(self, ws, ws_in_pixels=False, circular=False):
+    def filter_chm(self, ws, ws_in_pixels=True, circular=False):
         ''' Pre-process the canopy height model (smoothing and outlier removal).
         The original CHM (self.chm0) is not overwritten, but a new one is
         stored (self.chm).
@@ -459,8 +447,8 @@ class PyCrown:
         self.chm[zmask] = 0
         print("<-- CHM Filtered.")
 
-    def tree_detection(self, raster, resolution=None, ws=5, hmin=20,
-                       return_trees=False, ws_in_pixels=False):
+    def tree_detection(self, raster, resolution=None, ws=20, hmin=1.4,
+                       return_trees=False, ws_in_pixels=True):
         ''' Detect individual trees from CHM raster based on a maximum filter.
         Identified trees are either stores as list in the tree dataframe or
         returned as ndarray.
@@ -499,6 +487,9 @@ class PyCrown:
             else:
                 ws = int(ws / resolution)
 
+        tt = time.time()
+        timeit = "<-- Tree detection took {:.2f}s:"
+
         print("--> Apply scipy.ndimage.filters.maximum_filter to find maximum value within window size...")
         raster_maximum = filters.maximum_filter(
             raster,
@@ -535,12 +526,16 @@ class PyCrown:
         else:
             df = pd.DataFrame(np.array([trees, trees], dtype='object').T,
                               dtype='object', columns=['top_cor', 'top'])
+            ## hard code index to tree_id column, because in the end
+            ## some trees don't have crowns and some crowns don't have trees.
+            ## this will keep the tree point, crowns, and LAS all with the same ID no matter what gets filtered.
+            df["tree_id"] = df.index.values
             self.trees = pd.concat([self.trees, df])
-        print("<-- Applied; Tree Detection Complete:\n    - Number of trees detected: {len(self.trees)}")
-
+        print(f"<-- Applied; Tree Detection Complete:\n    - Number of trees detected: {len(self.trees)}")
+        print(timeit.format(time.time() - tt))
         self._check_empty()
 
-    def crown_delineation(self, algorithm, loc='top', **kwargs):
+    def crown_delineation(self, algorithm, loc='top', th_tree=1.4, **kwargs):
         """ Function calling external crown delineation algorithms
 
         Parameters
@@ -552,12 +547,12 @@ class PyCrown:
                       'watershed_skimage'
         loc :        str, optional
                      tree seed position: `top` or `top_cor`
+        th_tree :    float
+                     minimum height of tree seed (in m)
         th_seed :    float
                      factor 1 for minimum height of tree crown
         th_crown :   float
                      factor 2 for minimum height of tree crown
-        th_tree :    float
-                     minimum height of tree seed (in m)
         max_crown :  float
                      maximum radius of tree crown (in m)
 
@@ -581,7 +576,8 @@ class PyCrown:
             max_crown = kwargs['max_crown'] / self.resolution
 
         print(f"--> Delineating crowns using the {algorithm} algorithm...")
-        timeit = "<-- Delineation took {:.3f}s:"
+        print(f"    - This may take a minute depending on CHM resolution...")
+        timeit = "<-- Delineation took {:.2f}s:"
         if algorithm == 'dalponte_cython':
             print("dalponte_cython algorithm not available. using dalponteCIRC_numba instead.")
             algorithm = 'dalponteCIRC_numba'
@@ -592,7 +588,7 @@ class PyCrown:
                 inraster, seeds,
                 th_seed=float(kwargs['th_seed']),
                 th_crown=float(kwargs['th_crown']),
-                th_tree=float(kwargs['th_tree']),
+                th_tree=float(th_tree),
                 max_crown=float(max_crown)
             )
             print(timeit.format(time.time() - tt))
@@ -603,7 +599,7 @@ class PyCrown:
                 inraster, seeds,
                 th_seed=float(kwargs['th_seed']),
                 th_crown=float(kwargs['th_crown']),
-                th_tree=float(kwargs['th_tree']),
+                th_tree=float(th_tree),
                 max_crown=float(max_crown)
             )
             print(timeit.format(time.time() - tt))
@@ -611,12 +607,11 @@ class PyCrown:
         elif algorithm == 'watershed_skimage':
             tt = time.time()
             crowns = self._watershed(
-                inraster, th_tree=float(kwargs['th_tree'])
+                inraster, th_tree=float(th_tree)
             )
             print(timeit.format(time.time() - tt))
 
         self.crowns = np.array(crowns, dtype=np.int32)
-        print(f"    - Number of crowns delineated: {len(self.crowns)}")
 
     def correct_tree_tops(self, check_all=False):
         """ Correct the location of tree tops in steep terrain.
@@ -642,6 +637,9 @@ class PyCrown:
         corr_com = 0
 
         print("--> Check if tree top is too far down-slope compared to crown_mean...")
+        print("    - This may take a while depending on how many trees were delineated...")
+        start_time = time.time()
+        ## TODO: provide updates on progress.
         for tidx in range(len(self.trees)):
             tree = self.trees.iloc[tidx]
             col, row = self._to_colrow(tree['top'].x, tree['top'].y,
@@ -676,44 +674,25 @@ class PyCrown:
                 if dist_dh_com <= (1. * np.nanmean(distances)):
                     cor_col, cor_row = dsmhigh[1], dsmhigh[0]
                     corr_dsm += 1
-                    self.trees.tt_corrected.iloc[tidx] = 1
+                    self.trees.tt_corrected.iloc[tidx] = 1 # Corrected to DSM location.
                 else:
                     cor_col, cor_row = comass[tidx][1], comass[tidx][0]
                     corr_com += 1
-                    self.trees.tt_corrected.iloc[tidx] = 2
+                    self.trees.tt_corrected.iloc[tidx] = 2 # Corrected to centre of mass
 
                 # Set new tree top height
                 self.trees.top_cor.iloc[tidx] = \
                     Point(*self._to_lonlat(cor_col, cor_row, self.resolution))
 
             else:
-                self.trees.tt_corrected.iloc[tidx] = 0
-        print("<-- Checked:")
+                self.trees.tt_corrected.iloc[tidx] = 0 # No correction.
+        print(f"<-- Corrections took {time.time() - start_time}s:")
 
         if len(self.trees) > 0:
-            print(f'    - Tree tops corrected: {100 * corr_n / len(self.trees)}%')
+            print(f'    - Tree tops corrected: {round(100 * corr_n / len(self.trees), 2)}%')
             print(f'    - Corrected tree top by moving to DSM high point: {corr_dsm}')
             print(f'    - Corrected tree top by moving Center of Mass: {corr_com}')
         return corr_dsm, corr_com
-
-    def screen_small_trees(self, hmin=20., loc='top'):
-        """ Remove small trees from index based on minimum threshold.
-        Tree dataframe and crowns raster is updated.
-
-        Parameters
-        ----------
-        hmin :    float
-                  minimum height of tree top
-        loc :     str, optional
-                  tree seed position: `top` or `top_cor`
-        """
-        cond = self.trees[f'{loc}_height'] >= hmin
-        self.trees = self.trees[cond]
-
-        if isinstance(self.crowns, np.ndarray):
-            self._screen_crowns(cond)
-
-        self._check_empty()
 
     def crowns_to_polys_raster(self):
         ''' Converts tree crown raster to individual polygons and stores them
@@ -729,6 +708,99 @@ class PyCrown:
                 edges[i] = self._to_lonlat(*edges[i], self.resolution)
 
             polys.append(Polygon(edges))
+
+        ## TODO: align polygons to their actual trees.
+        ## Issue: polygons not necessarily digitized into their array in the same order as trees.
+        #print("\n\npolys:")
+        #print(type(polys)) ## list
+        #print(polys)
+        ## ie [<POLYGON ((233139.291 461336.162, 233139.291 461336.062, 233139.591 461336.0...>, <POLYGON ((233136.591 461336.062,
+        #for poly in polys:
+        #    print(poly)
+        """
+        Fix by:
+        creating arcpy polygons from [polys]
+        creating arcpy points from self.trees.
+        
+        identity or spatial join points and polygons, to get tree_id associated with poly
+        convert arcpy polygons, in order of tree_id, back to Polygon(edges)
+        only then set self.trees.crown_poly_raster to polys.
+
+        """
+
+        ## output crown polys
+        crown_polys_temp = arcpy.management.CreateFeatureclass(
+            out_path = "memory",
+            out_name = "crown_polys_temp",
+            geometry_type = "POLYGON",
+            has_z = "ENABLED",
+            spatial_reference = self.srs
+        )
+        fields = ["SHAPE@"]
+        with arcpy.da.InsertCursor(crown_polys_temp, fields) as cursor:
+            for poly in polys:
+                ## Shapely polygon to geojson:
+                polygon_geojson = poly.__geo_interface__
+                ## Move geojson inot an array of points.
+                if polygon_geojson["type"] == "Polygon":
+                    polygon_points = arcpy.Array()
+                    coords = polygon_geojson["coordinates"][0]
+                    for coord in coords:
+                        polygon_points.add(arcpy.Point(coord[0], coord[1]))
+                    new_polygon = arcpy.Polygon(polygon_points, self.srs)
+                    cursor.insertRow([new_polygon])
+
+        ## output tree points
+        tree_points_temp = arcpy.management.CreateFeatureclass(
+            out_path = "memory",
+            out_name = "tree_points_temp",
+            geometry_type = "POINT",
+            has_z = "ENABLED",
+            spatial_reference = self.srs
+        )
+        arcpy.management.AddField(tree_points_temp, "tree_id", "Long")
+        fields = ["SHAPE@XYZ", "tree_id"]
+        with arcpy.da.InsertCursor(tree_points_temp, fields) as cursor:
+            for tree in range(len(self.trees)):
+                tree = self.trees.iloc[tree]
+                x_coord = tree["top"].x
+                y_coord = tree["top"].y
+                z_coord = tree["top_elevation"]
+                tree_id = int(tree["tree_id"])
+                point = arcpy.Point(float(x_coord), float(y_coord), float(z_coord))
+                point_geometry = arcpy.PointGeometry(point, self.srs)
+
+                # Insert the row
+                cursor.insertRow((point_geometry, tree_id))
+
+        crown_point_sj = arcpy.analysis.SpatialJoin(
+            target_features=crown_polys_temp,
+            join_features=tree_points_temp,
+            out_feature_class=r"memory\crown_point_sj",
+            join_operation="JOIN_ONE_TO_ONE",
+            join_type="KEEP_ALL",
+            match_option="CONTAINS",
+        )
+
+        crown_point_sj_sorted = arcpy.management.Sort(
+            in_dataset = crown_point_sj,
+            out_dataset = r"memory\crown_point_sj_sorted",
+            sort_field = "tree_id"
+        )
+
+        polys.clear()
+        with arcpy.da.SearchCursor(crown_point_sj_sorted, ["SHAPE@", "tree_id"]) as searchcursor:
+            for crown in searchcursor:
+                arcpy_array = arcpy.Array(crown[0])
+                arcpy_polygon = arcpy.Polygon(arcpy_array)
+                polygon_points = []
+                for part in arcpy_polygon:
+                    for point in part:
+                        if point:
+                            polygon_points.append((point.X, point.Y))
+                shapely_polygon = Polygon(polygon_points)
+                polys.append(shapely_polygon)
+
         self.trees.crown_poly_raster = polys
         print("<-- Tree crowns converted from raster to polys.")
 
@@ -736,7 +808,7 @@ class PyCrown:
                                store_las=True,
                                output_las_name="trees.las",
                                thin_perc=None,
-                               first_return=True):
+                               first_return=False):
         """ Smooth crown polygons using Dalponte & Coomes (2016) approach:
         Builds a convex hull around first return points (which lie within the
         rasterized crowns).
@@ -764,30 +836,24 @@ class PyCrown:
         else:
             lidar_geodf = self.las
 
+        print("--> Converting raster crowns to shapely polygons...")
+        ## use the corrected self.trees.crown_poly_raster geometry,
+        ## not the self.crowns polygons which don't align with tree_id
+        crown_geodf = gpd.GeoDataFrame(
+            pd.DataFrame(self.trees["tree_id"].to_numpy(), columns=["tree_id"]),
+            crs=f'epsg:{self.epsg}', geometry=self.trees["crown_poly_raster"]
+        )
+        print("<-- Converted.")
+
         print("--> Converting LAS point cloud to shapely points...")
         geometry = [Point(xy) for xy in zip(lidar_geodf.x, lidar_geodf.y)]
         lidar_geodf = gpd.GeoDataFrame(lidar_geodf, crs=f'epsg:{self.epsg}',
                                        geometry=geometry)
         print("<-- Converted.")
 
-
-        print("--> Converting raster crowns to shapely polygons...")
-        polys = []
-        for feature in rioshapes(self.crowns, mask=self.crowns.astype(bool)):
-            edges = np.array(list(zip(*feature[0]['coordinates'][0])))
-            edges = np.array(self._to_lonlat(edges[0], edges[1],
-                                             self.resolution)).T
-            polys.append(Polygon(edges))
-        crown_geodf = gpd.GeoDataFrame(
-            pd.DataFrame(np.arange(len(self.trees))),
-            crs=f'epsg:{self.epsg}', geometry=polys
-        )
-        print("<-- Converted.")
-
-        print("--> Attaching LiDAR points to corresponding crowns...")
+        print("--> Use geopandas.sjoin to spatial join LiDAR points to corresponding crowns...")
         lidar_in_crowns = gpd.sjoin(lidar_geodf, crown_geodf,
                                     predicate='within', how="inner")
-
         lidar_tree_class = np.zeros(lidar_in_crowns['index_right'].size)
         lidar_tree_mask = np.zeros(lidar_in_crowns['index_right'].size,
                                    dtype=bool)
@@ -795,9 +861,9 @@ class PyCrown:
 
         print("--> Creating convex hull around first return points...")
         polys = []
-        for tidx in range(len(self.trees)):
-            bool_indices = lidar_in_crowns['index_right'] == tidx
-            lidar_tree_class[bool_indices] = tidx
+        for tree_index in range(len(self.trees)):
+            bool_indices = lidar_in_crowns['tree_id'] == self.trees.iloc[tree_index].tree_id
+            lidar_tree_class[bool_indices] = self.trees.iloc[tree_index].tree_id
             points = lidar_in_crowns[bool_indices]
             # check that not all values are the same
             if len(points.z) > 1 and not np.allclose(points.z,
@@ -806,10 +872,10 @@ class PyCrown:
                 points = points[points.z >= threshold_otsu(points_threshold)]
                 if first_return:
                     points = points[points.return_num == 1]  # first returns
+            crown_unary_union = points.unary_union
+            lidar_tree_mask[bool_indices] = lidar_in_crowns[bool_indices].within(crown_unary_union)
             hull = points.unary_union.convex_hull
             polys.append(hull)
-            lidar_tree_mask[bool_indices] = \
-                lidar_in_crowns[bool_indices].within(hull)
         self.trees.crown_poly_smooth = polys
         print("<-- Created.")
 
@@ -825,13 +891,18 @@ class PyCrown:
             except OSError:
                 pass
 
-            if ".shp" not in output_las_name:
+            if ".las" not in output_las_name:
                 output_las_name = output_las_name + ".las"
             path_to_output_las = os.path.join(str(self.outpath), output_las_name)
 
             print("--> Classifying las...")
             lidar_in_crowns = lidar_in_crowns[lidar_tree_mask]
             lidar_tree_class = lidar_tree_class[lidar_tree_mask]
+    
+            #print("\n\n\nlidar_tree_class:")
+            #print(type(lidar_tree_class))
+            #print(lidar_tree_class)
+
             header = laspy.LasHeader()
             self.outpath.mkdir(parents=True, exist_ok=True)
             outfile = laspy.LasData(header)
@@ -883,7 +954,7 @@ class PyCrown:
         self._check_empty()
         print("<-- PyCrown.trees is not empty; good to continue.")
 
-    def export_tree_locations(self, loc='top', output_shape_name="top"):
+    def export_tree_tops(self, input_mask_file=None, input_mask_buffer=None, loc='top', output_shape_name="top"):
         """ Convert tree top raster indices to georeferenced 3D point shapefile
 
         Parameters
@@ -924,15 +995,14 @@ class PyCrown:
             in_table = output_feature_class,
             field_description =
                 [
-                    ["TreeID", "TEXT"],
-                    ["TreeHtMtr", "FLOAT"],
-                    ["Corrected", "TEXT"]
+                    ["TreeID", "LONG"],
+                    ["TreeHtMtr", "FLOAT"]
                 ]
         )
         print("<-- Added.")
 
         print(f"--> Inserting rows into {output_shape_name} at {path_to_output_shape}...")
-        fields = ["SHAPE@XYZ", "TreeID", "TreeHtMtr", "Corrected"]
+        fields = ["SHAPE@XYZ", "TreeID", "TreeHtMtr"]
         with arcpy.da.InsertCursor(output_feature_class, fields) as cursor:
             for tree_index in range(len(self.trees)):
                 tree = self.trees.iloc[tree_index]
@@ -940,52 +1010,77 @@ class PyCrown:
                 y_coord = tree[loc].y
                 z_coord = tree[f'{loc}_elevation']
                 TreeID = tree_index
-                TreeHeightMeters = round(float(tree[f'{loc}_height']), 3)
-                TreeTopCorrected = "DSM Height" if tree.tt_corrected == 1 else "Corrected to Center of Mass"
+                TreeHeightMeters = round(float(tree[f'{loc}_height']), 2)
                 point = arcpy.Point(float(x_coord), float(y_coord), float(z_coord))
                 point_geometry = arcpy.PointGeometry(point, self.srs)
 
                 # Insert the row
-                cursor.insertRow((point_geometry, TreeID, TreeHeightMeters, TreeTopCorrected))
+                cursor.insertRow((point_geometry, TreeID, TreeHeightMeters))
         print(f"<-- Saved {path_to_output_shape}.")
 
-        if loc == "top_cor":
-            print(f"--> On corrected tree tops, estimate DBH using power function derived from field data for Flagstaff Ponderosa Pine")
-            print(f"    See: https://www.sciencedirect.com/science/article/pii/S037811272031464X")
-            print(f"    See: https://www.sciencedirect.com/science/article/pii/S0378112724000185")
-            print("     - Add fields...")
-            arcpy.management.AddFields(
-                in_table = output_feature_class,
-                field_description =
-                [
-                    ["TreeDbhCm", "FLOAT"],
-                    ["TreeHtFt", "FLOAT"],
-                    ["TreeDbhIn", "FLOAT"],
-                ]
-            )
-            print("     - Added.")
-            print("     - Calculate fields...")
-            arcpy.management.CalculateField(
-                in_table=path_to_output_shape,
-                field="TreeDbhCm",
-                expression="calcDbh(!TreeHtMtr!)",
-                expression_type="PYTHON3",
-                code_block=
-                    ("def calcDbh(TreeHtMtr):\n"
-                     "    import math\n"
-                     "    return round(float(0.87*(math.pow(TreeHtMtr,1.23))), 2)")
-            )
-            arcpy.management.CalculateField(
-                in_table=path_to_output_shape,
-                field="TreeHtFt",
-                expression="round((!TreeHtMtr! * 3.28084), 2)"
-            )
-            arcpy.management.CalculateField(
-                in_table=path_to_output_shape,
-                field="TreeDbhIn",
-                expression="round((!TreeDbhCm! / 2.54), 2)"
-            )
-            print("     - Calculated.")
+        if input_mask_file is not None and arcpy.Exists(input_mask_file):
+            if input_mask_buffer is not None and input_mask_buffer > 0:
+                print(f"--> Removing trees within {input_mask_buffer} pixels of mask boundary...")
+                ## delete trees on the edge of the mask
+                mask_to_line = arcpy.management.FeatureToLine(
+                    in_features = input_mask_file,
+                    out_feature_class = r"memory\mask_to_line"
+                )
+
+                trees_feature_layer = arcpy.management.MakeFeatureLayer(
+                    in_features = output_feature_class,
+                    out_layer = "trees_feature_layer"
+                )
+
+                arcpy.management.SelectLayerByLocation(
+                    in_layer = trees_feature_layer,
+                    overlap_type="INTERSECT",
+                    select_features = mask_to_line,
+                    search_distance = f"{self.resolution*input_mask_buffer} Meters",
+                    selection_type="NEW_SELECTION"
+                )
+
+                arcpy.management.DeleteRows(
+                    in_rows = trees_feature_layer
+                )
+                print(f"<-- Deleted boundary trees within {input_mask_buffer} pixel buffer.")
+
+        print(f"--> Estimate DBH using power function derived from field data for Flagstaff Ponderosa Pine")
+        print(f"    See: https://www.sciencedirect.com/science/article/pii/S037811272031464X")
+        print(f"    See: https://www.sciencedirect.com/science/article/pii/S0378112724000185")
+        print("     - Add fields...")
+        arcpy.management.AddFields(
+            in_table = output_feature_class,
+            field_description =
+            [
+                ["TreeDbhCm", "FLOAT"],
+                ["TreeHtFt", "FLOAT"],
+                ["TreeDbhIn", "FLOAT"],
+            ]
+        )
+        print("     - Added.")
+        print("     - Calculate fields...")
+        arcpy.management.CalculateField(
+            in_table=path_to_output_shape,
+            field="TreeDbhCm",
+            expression="calcDbh(!TreeHtMtr!)",
+            expression_type="PYTHON3",
+            code_block=
+                ("def calcDbh(TreeHtMtr):\n"
+                    "    import math\n"
+                    "    return round(float(0.87*(math.pow(TreeHtMtr,1.23))), 2)")
+        )
+        arcpy.management.CalculateField(
+            in_table=path_to_output_shape,
+            field="TreeHtFt",
+            expression="round((!TreeHtMtr! * 3.28084), 2)"
+        )
+        arcpy.management.CalculateField(
+            in_table=path_to_output_shape,
+            field="TreeDbhIn",
+            expression="round((!TreeDbhCm! / 2.54), 2)"
+        )
+        print("     - Calculated.")
 
     def export_tree_crowns(self, crowntype="crown_poly_smooth", output_shape_name="crown_poly_smooth"):
         """ Convert tree crown raster to georeferenced polygon shapefile
@@ -1029,15 +1124,14 @@ class PyCrown:
             in_table = output_feature_class,
             field_description =
                 [
-                    ["TreeID", "TEXT"],
-                    ["TopHtMtr", "FLOAT"],
-                    ["CorrHtMtr", "FLOAT"]
+                    ["TreeID", "LONG"],
+                    ["TreeHtMtr", "FLOAT"]
                 ]
         )
         print("<-- Added.")
 
         print(f"--> Inserting rows into {output_shape_name} at {path_to_output_shape}...")
-        fields = ["SHAPE@", "TreeID", "TopHtMtr", "CorrHtMtr"]
+        fields = ["SHAPE@", "TreeID", "TreeHtMtr"]
         with arcpy.da.InsertCursor(output_feature_class, fields) as cursor:
             for tree_index in range(len(self.trees)):
                 tree = self.trees.iloc[tree_index]
@@ -1051,24 +1145,23 @@ class PyCrown:
 
                     TreeID = tree_index
                     TreeHeight = round(float(tree.top_height), 2)
-                    CorrHeight = round(float(tree.top_cor_height), 2)
+                    # CorrHeight = round(float(tree.top_cor_height), 2)
 
                     # Insert the row
-                    cursor.insertRow((polygon, TreeID, TreeHeight, CorrHeight))
+                    cursor.insertRow((polygon, TreeID, TreeHeight))
         print(f"<-- Saved {path_to_output_shape}.")
 
-        if crowntype == "crown_poly_smooth":
-            print("--> Join TreeDbhCm, TreeHtFt, and TreeDbhIn to crowns...")
-            corrected_tops_shape_name = f"{output_shape_name.split('_', 1)[0]}_PyCrownTreesCorrected.shp"
-            arcpy.management.JoinField(
-                in_data=path_to_output_shape,
-                in_field="TreeID",
-                join_table=os.path.join(str(self.outpath), corrected_tops_shape_name),
-                join_field="TreeID",
-                fields="TreeDbhCm;TreeHtFt;TreeDbhIn"
-            )
-            print("<-- Joined.")
-
+        print("--> Join TreeDbhCm, TreeHtFt, and TreeDbhIn to crowns...")
+        tree_tops_shape_name = f"{output_shape_name.split('_', 1)[0]}_PyCrownTrees.shp"
+        arcpy.management.JoinField(
+            in_data=path_to_output_shape,
+            in_field="TreeID",
+            join_table=os.path.join(str(self.outpath), tree_tops_shape_name),
+            join_field="TreeID",
+            fields="TreeDbhCm;TreeHtFt;TreeDbhIn"
+        )
+        print("<-- Joined.")
+        
     def export_raster(self, raster, output_raster_name, input_mask_file, res=None):
         """ Write array to raster file with gdal
 

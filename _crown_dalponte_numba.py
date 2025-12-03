@@ -5,7 +5,7 @@ Copyright: 2018, Jan Zörner
 Licence: GNU GPLv3
 """
 
-from numba import jit, float32, int32, float_
+from numba import float32, int32
 import numpy as np
 
 def crown_dalponte(Chm, Trees, th_seed, th_crown, th_tree, max_crown):
