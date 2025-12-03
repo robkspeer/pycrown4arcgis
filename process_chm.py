@@ -203,15 +203,14 @@ class ProcessCrowns:
                 pycrown_DSM,
                 pycrown_LAS,
                 input_mask_file,
-                chm_smooth_window_size = 1,
+                input_mask_buffer = 2,
+                chm_smooth_window_size = 5,
                 chm_smooth_circular = True,
-                tree_detection_window_size = 1.5,
-                tree_detection_min_height = 1.4,
+                tree_detection_window_size = 20,
                 crown_delineation_algorithm = "watershed_skimage",
                 crown_delineation_th_seed = 0.45,
                 crown_delineation_th_crown = 0.55,
-                crown_delineation_th_tree = 2,
-                crown_delineation_max_crown = 10,
+                crown_delineation_max_crown = 1.4,
                 pro_project = None):
         """ ProcessCrowns class
         """
@@ -250,94 +249,122 @@ class ProcessCrowns:
 
         PC.tree_detection(
             raster = PC.chm,
-            ws = tree_detection_window_size,
-            hmin = tree_detection_min_height
-            )
+            ws = tree_detection_window_size
+        )
 
         PC.crown_delineation(
             algorithm = crown_delineation_algorithm,
-            loc = "top",
+            loc = "top_cor",
             th_seed = crown_delineation_th_seed,
             th_crown = crown_delineation_th_crown,
-            th_tree = crown_delineation_th_tree,
-            max_crown = crown_delineation_max_crown)
-
-        PC.correct_tree_tops(check_all=True)
+            max_crown = crown_delineation_max_crown
+        )
 
         PC.get_tree_height_elevation(loc='top')
 
-        PC.get_tree_height_elevation(loc='top_cor')
+        ## TODO: Make correcting treetops an option. It takes a long time, and seems to provide a lower height than
+        ## the original tree tops, which then underestimates the DBH even more.
+        #PC.correct_tree_tops(check_all=False)
+        #PC.get_tree_height_elevation(loc='top_cor')
+        #PC.quality_control()
 
         PC.crowns_to_polys_raster()
 
+        ## TODO: Separate this so that smoothing is an option. It takes a long time and we're currently using the
+        ## raster output for our finished product.
         PC.crowns_to_polys_smooth(
             store_las=True,
             output_las_name = f"{project_basename}_PyCrownTrees"
         )
 
-        PC.quality_control()
-
+        ## TODO: Option for which final layers to export.
+        ## Better yet, separate this and the adding to map to a different class/method
         PC.export_raster(
             raster = PC.chm,
             output_raster_name = f"{project_basename}_PyCrownCHM",
             input_mask_file = input_mask_file
         )
-        PC.export_tree_locations(
+        PC.export_tree_tops(
+            input_mask_file = input_mask_file,
+            input_mask_buffer = input_mask_buffer,
             loc = "top",
             output_shape_name = f"{project_basename}_PyCrownTrees"
-        )
-        PC.export_tree_locations(
-            loc = "top_cor",
-            output_shape_name = f"{project_basename}_PyCrownTreesCorrected"
         )
         PC.export_tree_crowns(
             crowntype = "crown_poly_raster",
             output_shape_name = f"{project_basename}_PyCrownPolyRaster"
         )
+        """
+        PC.export_tree_tops(
+            input_mask_file = input_mask_file,
+            input_mask_buffer = input_mask_buffer,
+            loc = "top_cor",
+            output_shape_name = f"{project_basename}_PyCrownTreesCorrected"
+        )
         PC.export_tree_crowns(
             crowntype = "crown_poly_smooth",
             output_shape_name = f"{project_basename}_PyCrownPolySmooth"
         )
+        """
 
         try:
             if active_map is not None:
                 print("\n--> Add new layers to map...")
+                module_path = os.path.abspath(__file__)
+                module_dir = os.path.dirname(module_path)
+
                 ## TREETOPS LAYER:
-                treetops_layer = active_map.addDataFromPath(os.path.join(pycrown_result_directory, f"{project_basename}_PyCrownTreesCorrected.shp"))
+                treetops_layer_file_path = os.path.join(module_dir, "PyCrownTrees.json")
+                treetops_layer_cim : str
+                try:
+                    with open(treetops_layer_file_path, 'r') as template_layer_file:
+                        treetops_layer_cim = json.load(template_layer_file)
+                except FileNotFoundError:
+                    print("Error: 'PyCrownTrees.json' not found.")
+                    raise Exception
+                except json.JSONDecodeError:
+                    print("Error: Invalid JSON format in 'PyCrownTreesCorrected.json'.")
+                    raise Exception
+                treetops_layer_cim["layerDefinitions"][0]["name"] = f"{project_basename}_PyCrownTrees"
+                treetops_layer_cim["layerDefinitions"][0]["featureTable"]["dataConnection"]["workspaceConnectionString"] = "DATABASE=" + pycrown_result_directory
+                treetops_layer_cim["layerDefinitions"][0]["featureTable"]["dataConnection"]["dataset"] = f"{project_basename}_PyCrownTrees.shp"
+
+                path_to_new_treetops_layer_file = os.path.join(pycrown_result_directory, f"{project_basename}_PyCrownTrees.lyrx")
+                with open(path_to_new_treetops_layer_file, 'w') as new_treetops_layer_file:
+                    json.dump(treetops_layer_cim, new_treetops_layer_file, indent=2)
+
+                treetops_layer = active_map.addDataFromPath(path_to_new_treetops_layer_file)
                 active_map.addLayerToGroup(target_group_layer = target_group_layer,
                                            add_layer_or_layerfile = treetops_layer,
                                            add_position = "TOP")
                 active_map.removeLayer(treetops_layer)
 
                 ## CROWNS LAYER:
-                polysmooth_layer = active_map.addDataFromPath(os.path.join(pycrown_result_directory, f"{project_basename}_PyCrownPolySmooth.shp"))
+                polyraster_layer = active_map.addDataFromPath(os.path.join(pycrown_result_directory, f"{project_basename}_PyCrownPolyRaster.shp"))
                 ## access cartographic information model (cim) to set symbology:
-                polysmooth_layer_cim = polysmooth_layer.getDefinition("V3")
-                polysmooth_layer_cim_symbol_outline = polysmooth_layer_cim.renderer.symbol.symbol.symbolLayers[0]
-                polysmooth_layer_cim_symbol_outline.width = 1.5
-                polysmooth_layer_cim_symbol_outline.color = {
+                polyraster_layer_cim = polyraster_layer.getDefinition("V3")
+                polyraster_layer_cim_symbol_outline = polyraster_layer_cim.renderer.symbol.symbol.symbolLayers[0]
+                polyraster_layer_cim_symbol_outline.width = 1.5
+                polyraster_layer_cim_symbol_outline.color = {
                     "type" : "CIMRGBColor",
                     "values" : [0, 0, 0, 100]
                 }
-                polysmooth_layer_cim_symbol_fill = polysmooth_layer_cim.renderer.symbol.symbol.symbolLayers[1]
-                polysmooth_layer_cim_symbol_fill.color = {
+                polyraster_layer_cim_symbol_fill = polyraster_layer_cim.renderer.symbol.symbol.symbolLayers[1]
+                polyraster_layer_cim_symbol_fill.color = {
                     "type" : "CIMRGBColor",
                     "values" : [255, 255, 255, 0]
                 }
-                polysmooth_layer.setDefinition(polysmooth_layer_cim)
+                polyraster_layer.setDefinition(polyraster_layer_cim)
                 active_map.addLayerToGroup(target_group_layer = target_group_layer,
-                                           add_layer_or_layerfile = polysmooth_layer,
+                                           add_layer_or_layerfile = polyraster_layer,
                                            add_position = "BOTTOM")
-                active_map.removeLayer(polysmooth_layer)
+                active_map.removeLayer(polyraster_layer)
 
                 ## LAS LAYER:
-                module_path = os.path.abspath(__file__)
-                module_dir = os.path.dirname(module_path)
-                layer_file_path = os.path.join(module_dir, "PyCrownLasTrees.json")
-
+                las_layer_file_path = os.path.join(module_dir, "PyCrownLasTrees.json")
                 las_layer_cim : str
                 try:
-                    with open(layer_file_path, 'r') as template_layer_file:
+                    with open(las_layer_file_path, 'r') as template_layer_file:
                         las_layer_cim = json.load(template_layer_file)
                 except FileNotFoundError:
                     print("Error: 'PyCrownLasTrees.json' not found.")
@@ -379,6 +406,34 @@ class ProcessCrowns:
 
                 target_group_layer.isExpanded = True
                 print("<-- Layers added.")
+
+                """
+                ## CORRECTED TREETOPS LAYER:
+                treetops_layer_file_path = os.path.join(module_dir, "PyCrownTrees.json")
+                treetops_layer_cim : str
+                try:
+                    with open(treetops_layer_file_path, 'r') as template_layer_file:
+                        treetops_layer_cim = json.load(template_layer_file)
+                except FileNotFoundError:
+                    print("Error: 'PyCrownTrees.json' not found.")
+                    raise Exception
+                except json.JSONDecodeError:
+                    print("Error: Invalid JSON format in 'PyCrownTreesCorrected.json'.")
+                    raise Exception
+                treetops_layer_cim["layerDefinitions"][0]["name"] = f"{project_basename}_PyCrownTreesCorrected"
+                treetops_layer_cim["layerDefinitions"][0]["featureTable"]["dataConnection"]["workspaceConnectionString"] = "DATABASE=" + pycrown_result_directory
+                treetops_layer_cim["layerDefinitions"][0]["featureTable"]["dataConnection"]["dataset"] = f"{project_basename}_PyCrownTreesCorrected.shp"
+
+                path_to_new_treetops_layer_file = os.path.join(pycrown_result_directory, f"{project_basename}_PyCrownTreesCorrected.lyrx")
+                with open(path_to_new_treetops_layer_file, 'w') as new_treetops_layer_file:
+                    json.dump(treetops_layer_cim, new_treetops_layer_file, indent=2)
+
+                treetops_layer = active_map.addDataFromPath(path_to_new_treetops_layer_file)
+                active_map.addLayerToGroup(target_group_layer = target_group_layer,
+                                           add_layer_or_layerfile = treetops_layer,
+                                           add_position = "TOP")
+                active_map.removeLayer(treetops_layer)
+                """
 
         except Exception as e:
             print(f"\n\nEXCEPTION: {e}")
