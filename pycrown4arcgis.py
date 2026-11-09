@@ -13,7 +13,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-import random
 
 import scipy.ndimage as ndimage
 import scipy.ndimage.filters as filters
